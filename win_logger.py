@@ -4,15 +4,85 @@ MODULE A: The Win Logger.
 Appends timestamped "wins" to a local Markdown file (daily_wins.md),
 formatted like a clean engineering log:  * [Time] Win description
 
-This module is self-contained: it doesn't call Ollama at all, it just
-does simple text parsing + file writing. That keeps it fast and reliable.
+Time extraction stays regex-based (fast, deterministic, no need to bother
+the AI with something a simple pattern already handles perfectly).
+
+Cleaning the WORDING of the win, however, is handled by Ollama: it reads
+your raw sentence and extracts just the core accomplishment in past tense.
+This handles far more phrasing variety than a fixed prefix list ever could.
+If Ollama is unreachable, a simple regex-based fallback keeps the logger
+working offline.
 """
 
+import os
 import re
 from datetime import datetime
 from dateutil import parser as date_parser  # pip install python-dateutil
 
 from config import WINS_FILE
+from ollama_client import generate_response
+
+# --- AI-based cleaning ---
+
+# A strict, non-conversational system prompt. This is deliberately NOT the
+# coach persona from config.py -- for this task we want a precise text tool,
+# not a motivational speaker, so the output formats cleanly in the log file.
+_EXTRACTION_SYSTEM_PROMPT = (
+    "You are a precise text-extraction tool. You are not a conversational assistant "
+    "and you must never behave like one.\n\n"
+    "Your ONLY job: read the user's raw sentence about something they did, and output "
+    "the core accomplishment as a short phrase in past tense, suitable for a clean "
+    "engineering log.\n\n"
+    "Rules:\n"
+    "- Output ONLY the cleaned phrase. No preamble, no explanation, no quotation marks, "
+    "no trailing period, nothing else.\n"
+    "- Remove commands and lead-ins such as 'log that', 'log a win', 'note that'.\n"
+    "- Remove pronouns such as 'I', 'I just', 'I've'.\n"
+    "- Remove filler and conversational tone.\n"
+    "- Rewrite in past tense if it isn't already.\n"
+    "- Do not include any time, date, or timestamp in the output -- that is handled "
+    "separately.\n"
+    "- Do not add any information that was not in the original sentence.\n"
+    "- Keep it short: ideally under 12 words.\n"
+    "- Capitalize the first letter of the output.\n\n"
+    "Examples:\n"
+    "Input: log a win that I successfully studied electronics for 2 hours\n"
+    "Output: Studied electronics for 2 hours\n\n"
+    "Input: I just crushed my workout at the gym\n"
+    "Output: Crushed workout at the gym"
+)
+
+
+def _clean_description_ai(text: str) -> str:
+    """
+    Ask Ollama to extract a clean, past-tense description of the win.
+
+    Returns the cleaned string, or None if the AI call failed or returned
+    something unusable (so the caller can fall back to the regex cleaner).
+    """
+    raw_reply = generate_response(
+        prompt=text,
+        system_prompt=_EXTRACTION_SYSTEM_PROMPT,
+        temperature=0.2,  # low temperature: we want consistent, boring, predictable output
+    )
+
+    # generate_response() returns a "⚠️ ..." string on connection/timeout errors
+    # instead of raising -- treat that as a failure so we can fall back.
+    if not raw_reply or raw_reply.startswith("\u26a0\ufe0f"):
+        return None
+
+    # Ollama usually follows instructions, but strip stray quotes/whitespace
+    # just in case, so a mis-formatted reply doesn't corrupt the log file.
+    cleaned = raw_reply.strip().strip('"').strip("'").strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+
+    if not cleaned:
+        return None
+
+    return cleaned[0].upper() + cleaned[1:]
+
+
+# --- Regex-based fallback (used only if Ollama is unreachable) ---
 
 # Filler phrases we strip off the front of a sentence so the log reads cleanly.
 # Order matters: longer/more specific phrases should come first.
@@ -48,10 +118,10 @@ def _extract_time(matched_time_str: str) -> datetime:
         return datetime.now()
 
 
-def _clean_description(text: str, matched_time_str: str) -> str:
+def _clean_description_fallback(text: str, matched_time_str: str) -> str:
     """
-    Strip the matched time expression and common filler phrases out of the
-    sentence, leaving just a clean description of the win.
+    Regex-only cleanup, used ONLY if Ollama can't be reached. Strips the
+    matched time expression and common filler phrases from the sentence.
     """
     cleaned = text.strip()
 
@@ -84,14 +154,26 @@ def log_win(raw_text: str) -> str:
     """
     match = _TIME_PATTERN.search(raw_text)
     matched_time_str = match.group(0) if match else None
-
     entry_time = _extract_time(matched_time_str)
-    description = _clean_description(raw_text, matched_time_str)
+
+    # Strip the time expression out before handing the text to the AI, so it
+    # doesn't have to worry about (or accidentally repeat) the timestamp.
+    text_without_time = raw_text.replace(matched_time_str, "") if matched_time_str else raw_text
+
+    description = _clean_description_ai(text_without_time)
+    if description is None:
+        # Ollama unreachable or returned something unusable -- fall back
+        # to the regex cleaner so logging a win still works offline.
+        description = _clean_description_fallback(raw_text, matched_time_str)
 
     time_label = entry_time.strftime("%Y-%m-%d %I:%M %p")
     log_line = f"* [{time_label}] {description}\n"
 
     file_exists = _file_exists(WINS_FILE)
+
+    # Make sure the target folder exists (e.g. in case Documents is
+    # redirected somewhere unusual) so the file write doesn't crash.
+    os.makedirs(os.path.dirname(WINS_FILE), exist_ok=True)
 
     with open(WINS_FILE, "a", encoding="utf-8") as f:
         if not file_exists:

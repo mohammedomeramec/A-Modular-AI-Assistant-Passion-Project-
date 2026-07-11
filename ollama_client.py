@@ -9,13 +9,16 @@ import requests
 from config import OLLAMA_URL, MODEL_NAME, SYSTEM_PROMPT
 
 
-def generate_response(prompt: str, system_prompt: str = SYSTEM_PROMPT) -> str:
+def generate_response(prompt: str, system_prompt: str = SYSTEM_PROMPT, temperature: float = 0.7) -> str:
     """
     Send a prompt to the local Ollama model and return its text response.
 
     Args:
         prompt: The user-facing question / instruction for the model.
         system_prompt: The "personality" instructions. Defaults to the coach persona.
+        temperature: Controls randomness. Lower (e.g. 0.2) = more consistent/predictable,
+            good for structured extraction tasks. Higher (e.g. 0.7-1.0) = more varied,
+            good for natural conversation. Defaults to 0.7 for normal chat.
 
     Returns:
         The model's reply as a plain string. Returns a friendly error message
@@ -27,6 +30,9 @@ def generate_response(prompt: str, system_prompt: str = SYSTEM_PROMPT) -> str:
         "prompt": prompt,
         "system": system_prompt,
         "stream": False,  # simplest option for a beginner script: wait for the full reply
+        "options": {
+            "temperature": temperature,
+        },
     }
 
     try:
