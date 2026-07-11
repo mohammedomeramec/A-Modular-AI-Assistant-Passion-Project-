@@ -30,38 +30,66 @@ from ollama_client import generate_response
 _EXTRACTION_SYSTEM_PROMPT = (
     "You are a precise text-extraction tool. You are not a conversational assistant "
     "and you must never behave like one.\n\n"
-    "Your ONLY job: read the user's raw sentence about something they did, and output "
-    "the core accomplishment as a short phrase in past tense, suitable for a clean "
+    "You will receive either ONE message (\"Current message\") or TWO messages "
+    "(\"Previous message\" and \"Current message\"). The current message is what "
+    "the user just said. Sometimes the current message is only a short command "
+    "like 'log that', 'can you log that?', or 'log it' -- in that case, the word "
+    "'that'/'it' refers back to whatever was described in the PREVIOUS message, "
+    "and the actual accomplishment to extract lives in the PREVIOUS message, not "
+    "the current one.\n\n"
+    "Your ONLY job: figure out the core accomplishment being described (using the "
+    "previous message for context if the current message is just a bare command), "
+    "and output it as a short phrase in past tense, suitable for a clean "
     "engineering log.\n\n"
     "Rules:\n"
     "- Output ONLY the cleaned phrase. No preamble, no explanation, no quotation marks, "
     "no trailing period, nothing else.\n"
-    "- Remove commands and lead-ins such as 'log that', 'log a win', 'note that'.\n"
+    "- Never output the words 'previous' or 'current' -- those labels are only for "
+    "your understanding, not part of the answer.\n"
+    "- Remove commands like 'log that', 'log it', 'log this', 'note that', 'log a win', "
+    "'can you log that' -- these can appear ANYWHERE, in either message.\n"
     "- Remove pronouns such as 'I', 'I just', 'I've'.\n"
     "- Remove filler and conversational tone.\n"
     "- Rewrite in past tense if it isn't already.\n"
     "- Do not include any time, date, or timestamp in the output -- that is handled "
     "separately.\n"
-    "- Do not add any information that was not in the original sentence.\n"
+    "- Do not add any information that was not in the original message(s).\n"
     "- Keep it short: ideally under 12 words.\n"
     "- Capitalize the first letter of the output.\n\n"
-    "Examples:\n"
-    "Input: log a win that I successfully studied electronics for 2 hours\n"
+    "Examples:\n\n"
+    "Current message: log a win that I successfully studied electronics for 2 hours\n"
     "Output: Studied electronics for 2 hours\n\n"
-    "Input: I just crushed my workout at the gym\n"
-    "Output: Crushed workout at the gym"
+    "Current message: I just crushed my workout at the gym\n"
+    "Output: Crushed workout at the gym\n\n"
+    "Current message: i ate lunch pretty fast. log it\n"
+    "Output: Ate lunch fast\n\n"
+    "Previous message: i just ate my lunch fast. feeling good\n"
+    "Current message: can you log that?\n"
+    "Output: Ate lunch fast"
 )
 
 
-def _clean_description_ai(text: str) -> str:
+def _clean_description_ai(text: str, previous_turn: str = None) -> str:
     """
     Ask Ollama to extract a clean, past-tense description of the win.
+
+    Args:
+        text: The current user message (with any matched time expression
+            already stripped out).
+        previous_turn: The user's previous message, if any. Included so the
+            model can resolve references like "log that" back to what was
+            actually described a moment ago.
 
     Returns the cleaned string, or None if the AI call failed or returned
     something unusable (so the caller can fall back to the regex cleaner).
     """
+    if previous_turn:
+        prompt = f'Previous message: "{previous_turn}"\nCurrent message: "{text}"'
+    else:
+        prompt = f'Current message: "{text}"'
+
     raw_reply = generate_response(
-        prompt=text,
+        prompt=prompt,
         system_prompt=_EXTRACTION_SYSTEM_PROMPT,
         temperature=0.2,  # low temperature: we want consistent, boring, predictable output
     )
@@ -118,36 +146,74 @@ def _extract_time(matched_time_str: str) -> datetime:
         return datetime.now()
 
 
-def _clean_description_fallback(text: str, matched_time_str: str) -> str:
+def _clean_description_fallback(text: str, matched_time_str: str, previous_turn: str = None) -> str:
     """
     Regex-only cleanup, used ONLY if Ollama can't be reached. Strips the
-    matched time expression and common filler phrases from the sentence.
+    matched time expression and common filler phrases from the sentence,
+    whether they appear at the start or the end (e.g. "...pretty fast. log it").
+
+    If the current message turns out to be just a bare command ("log that",
+    "can you log that?") with nothing left after stripping, falls back to
+    cleaning the previous message instead -- the offline equivalent of the
+    AI's context resolution.
     """
     cleaned = text.strip()
 
     if matched_time_str:
         cleaned = cleaned.replace(matched_time_str, "")
 
-    lowered = cleaned.lower()
-    for prefix in _PREFIXES_TO_STRIP:
-        if lowered.startswith(prefix):
-            cleaned = cleaned[len(prefix):]
-            lowered = cleaned.lower()
+    # Detect a message that is ENTIRELY a bare logging command with no real
+    # content of its own (e.g. "can you log that?", "please log this.").
+    # Check this first so we don't need the more complex trailing-strip
+    # regex below to also account for every punctuation combination.
+    bare_command_pattern = re.compile(
+        r"^\s*(can you|could you|please)?\s*log\s+(it|this|that)\s*[.?!]*\s*$",
+        re.IGNORECASE,
+    )
+    if bare_command_pattern.match(cleaned):
+        cleaned = ""
+    else:
+        # Strip trailing command phrases like ". log it", "log this", "- log that"
+        # (handles cases where the command is tacked onto real content, and
+        # allows for a trailing "?" / "!" / "." after the command).
+        cleaned = re.sub(
+            r"[.,;\-\s]*\blog\s+(it|this|that)\b\s*[.?!]*\s*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
 
-    # Clean up leftover connector words ("at", trailing commas) and whitespace
-    cleaned = re.sub(r"\bat\s*$", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,-")
+        lowered = cleaned.lower()
+        for prefix in _PREFIXES_TO_STRIP:
+            if lowered.startswith(prefix):
+                cleaned = cleaned[len(prefix):]
+                lowered = cleaned.lower()
+
+        # Also strip a leading question phrase like "can you"
+        cleaned = re.sub(r"^\s*can you\s+", "", cleaned, flags=re.IGNORECASE)
+
+        # Clean up leftover connector words ("at", trailing commas) and whitespace
+        cleaned = re.sub(r"\bat\s*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,-?!")
+
+    if not cleaned and previous_turn:
+        # Nothing usable in the current message (it was just a bare command)
+        # -- fall back to cleaning the previous message instead.
+        return _clean_description_fallback(previous_turn, None)
 
     return cleaned.capitalize() if cleaned else "Unspecified win"
 
 
-def log_win(raw_text: str) -> str:
+def log_win(raw_text: str, previous_turn: str = None) -> str:
     """
     Parse a sentence describing a win, extract an optional time, and append
     a clean, timestamped entry to daily_wins.md.
 
     Args:
-        raw_text: The user's original sentence, e.g. "Log that I studied at 2 PM".
+        raw_text: The user's current message, e.g. "can you log that?".
+        previous_turn: The user's previous message, if any. Used to resolve
+            references like "log that" back to what was actually described
+            a moment ago (e.g. "I just ate my lunch fast. feeling good").
 
     Returns:
         A short confirmation message to show the user.
@@ -160,11 +226,11 @@ def log_win(raw_text: str) -> str:
     # doesn't have to worry about (or accidentally repeat) the timestamp.
     text_without_time = raw_text.replace(matched_time_str, "") if matched_time_str else raw_text
 
-    description = _clean_description_ai(text_without_time)
+    description = _clean_description_ai(text_without_time, previous_turn=previous_turn)
     if description is None:
         # Ollama unreachable or returned something unusable -- fall back
         # to the regex cleaner so logging a win still works offline.
-        description = _clean_description_fallback(raw_text, matched_time_str)
+        description = _clean_description_fallback(raw_text, matched_time_str, previous_turn=previous_turn)
 
     time_label = entry_time.strftime("%Y-%m-%d %I:%M %p")
     log_line = f"* [{time_label}] {description}\n"
